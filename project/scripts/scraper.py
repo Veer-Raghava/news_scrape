@@ -9,7 +9,6 @@ import sys
 PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
-
 BASE = os.path.dirname(os.path.dirname(__file__))
 DATA = os.path.join(BASE, "data")
 
@@ -41,6 +40,37 @@ def is_bad(url):
     return any(ext in url.lower() for ext in BAD_EXT)
 
 
+# ------------------------------------------
+# CLEAN BOILERPLATE LINES
+# ------------------------------------------
+def clean_boilerplate(text):
+    BAD_PHRASES = [
+        "Posts from this topic will be added",
+        "Posts from this author will be added",
+        "A free daily digest",
+        "Sign up for Verge Deals",
+        "This is the title for the native ad",
+        "If you buy something from a Verge link",
+        "Vox Media may earn a commission",
+        "Read our review",
+        "Read our hands on"
+    ]
+
+    lines = [l.strip() for l in text.split("\n") if l.strip()]
+    cleaned = []
+
+    for line in lines:
+        if any(p in line for p in BAD_PHRASES):
+            continue
+        if lines.count(line) > 1:
+            if line not in cleaned:
+                cleaned.append(line)
+            continue
+        cleaned.append(line)
+
+    return "\n".join(cleaned)
+
+
 def extract_text(url):
     try:
         r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
@@ -55,7 +85,12 @@ def extract_text(url):
     paras = [p.get_text(" ", strip=True) for p in soup.find_all("p")]
     cleaned = [p for p in paras if len(p.split()) > 5]
 
-    return "\n".join(cleaned) if len(cleaned) >= 3 else None
+    if len(cleaned) < 3:
+        return None
+
+    text = "\n".join(cleaned)
+    text = clean_boilerplate(text)  # <<< ONLY ADDITIONAL LINE
+    return text
 
 
 def scrape():
@@ -70,7 +105,8 @@ def scrape():
 
         for line in q:
             item = json.loads(line)
-            url = item["link"]
+
+            url = item.get("link") or item.get("url")  # FIX FOR KEY ERROR
 
             if url in scraped_urls or is_bad(url):
                 continue
@@ -79,8 +115,7 @@ def scrape():
             text = extract_text(url)
 
             if not text or len(text.split()) < 80:
-                print("   ❌ TOO SHORT")
-                skipped += 1
+                print("   ❌ TOO SHORT — NOT SAVED")
                 continue
 
             rec = {
@@ -95,16 +130,14 @@ def scrape():
             }
 
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            add_scraped(url)
-            scraped_urls.add(url)
+            add_scraped(url)          # << MOVED HERE
+            scraped_urls.add(url)     # << AFTER SAVE
             saved += 1
 
             print(f"   ✔ SAVED ({rec['word_count']} words)")
 
-    # main fix — clear queue
     open(QUEUE, "w").close()
     print("\n🧹 queue cleared!")
-
     print(f"\n🎉 DONE — saved: {saved}, skipped: {skipped}")
 
 

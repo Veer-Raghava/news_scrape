@@ -16,8 +16,9 @@ def run():
         print("\n📰 Running Scraper...\n")
         subprocess.run(["python", SCRAPER_SCRIPT])
 
-        print("\n⏳ Sleeping for 3 hours...\n")
-        time.sleep(3 * 60 * 60)  # 3 hours = 10800 seconds
+        print("\n⏳ Sleeping for 2 hours...\n")
+
+        time.sleep(2*60*60)  
 
 if __name__ == "__main__":
     run()
