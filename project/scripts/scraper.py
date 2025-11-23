@@ -4,6 +4,11 @@ import requests
 from bs4 import BeautifulSoup
 from urllib.parse import urlparse
 import os
+import sys
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+sys.path.insert(0, PROJECT_ROOT)
+
 
 BASE = os.path.dirname(os.path.dirname(__file__))
 DATA = os.path.join(BASE, "data")

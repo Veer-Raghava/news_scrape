@@ -2,9 +2,15 @@ import feedparser
 import json
 import os
 from datetime import datetime
-from project.feeds.feeds_list import FEEDS #python -m project.scripts.rss_ingest
+ #python -m project.scripts.rss_ingest
+import sys
+
+PROJECT_ROOT = os.path.dirname(os.path.dirname(__file__))
+sys.path.insert(0, PROJECT_ROOT)
 
 
+from feeds.feeds_list import FEEDS
+ 
 # BASE = project_root
 BASE = os.path.dirname(os.path.dirname(__file__))
 DATA = os.path.join(BASE, "data")
