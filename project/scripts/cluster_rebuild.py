@@ -1,3 +1,4 @@
+# project/scripts/cluster_rebuild.py
 """
 Topic-aware clustering job for the news vector universe.
 
@@ -8,8 +9,10 @@ Modes (auto-detected):
    - Fetches ALL points (id, vector, payload) from Qdrant.
    - Runs HDBSCAN on full set.
    - Computes centroid + medoid per cluster.
-   - Infers a high-level TOPIC CATEGORY for each cluster:
-       politics, economy, tech, geopolitics, national, cinema, sports, etc.
+   - Infers a high-level TOPIC CATEGORY for each cluster
+     (with sub-flavour like sports.cricket, cine.bollywood, economy.agri, etc.).
+   - Tries to "rescue" HDBSCAN noise points by attaching them
+     to the nearest centroid if similarity is high enough.
    - Writes `cluster` (int) and `category` (str) into each point's payload.
    - Saves metadata to data/clusters.json.
 
@@ -20,12 +23,12 @@ Modes (auto-detected):
    - For each new cluster, assigns NEW global cluster IDs
      (continuing from previous max label).
    - Infers topic category for each new cluster.
+   - Again tries to attach any remaining noise to nearest centroid.
    - Writes labels + categories back into Qdrant.
    - Updates clusters.json with appended cluster metadata.
 
-→ Use this for "topic buckets" like politics / tech / sports.
-→ Use your ML service's /same_story* endpoints for per-event grouping
-   (multi-publisher coverage of the exact same story).
+→ Use this for broad topic buckets like politics.india / sports.cricket / economy.agri / cine.bollywood…
+→ Use the ML service /same_story_* endpoints for per-event "same news, many publishers".
 """
 
 import json
@@ -47,76 +50,363 @@ COLLECTION_NAME = "news_articles"
 VECTOR_SIZE = 768
 SCROLL_PAGE_SIZE = 10_000
 
-# HDBSCAN config
-MIN_CLUSTER_SIZE = 15      # tune if you want bigger/smaller topic buckets
-MIN_SAMPLES = None
+# HDBSCAN config → tune if needed
+# smaller min_cluster_size → more clusters, fewer points in noise
+MIN_CLUSTER_SIZE = 10
+MIN_SAMPLES = 1
 HDBSCAN_METRIC = "euclidean"
+
+# After HDBSCAN, try to attach noise points to nearest centroid
+# using cosine similarity on normalized vectors
+NOISE_ATTACH_THRESHOLD = 0.68  # SEMANTIC ATTACH threshold
 
 BASE = Path(__file__).resolve().parents[1]  # project/
 DATA_DIR = BASE / "data"
 CLUSTERS_JSON = DATA_DIR / "clusters.json"
 
-# Topic categories – tweak/extend as you like
+# ----------------- TOPIC CATEGORY DEFINITIONS ----------------- #
+# The trick here:
+# - We use very specific keywords, avoid super-generic ones like "crisis" or "strike".
+# - We lean on domain/source signals (bbc_sport, *_business, etc.) by
+#   including them in the text we score (title + source + domain).
+#
+# Each category gets a list of "strong hints". We later aggregate scores
+# across all titles in a cluster and pick the strongest.
+
 CATEGORY_KEYWORDS: Dict[str, List[str]] = {
-    "politics": [
-        "election", "vote", "poll", "parliament", "congress", "bjp",
-        "minister", "mp ", "mla", "chief minister", "cm ",
-        "government", "govt", "policy", "bill ", "cabinet", "politics",
+    # politics / governance / public policy
+    "politics.india": [
+        "lok sabha", "rajya sabha", "mla", "mp ",
+        "bjp", "congress", "aap ", "shiv sena",
+        "chief minister", "cm ", "assembly election",
+        "state election", "parliament", "raj bhavan",
+        "governor", "cabinet reshuffle", "model code of conduct",
+        "election commission", "eci ",
+        "new delhi", "union minister",
     ],
-    "economy": [
-        "gdp", "inflation", "economic", "economy", "sensex", "nifty",
-        "stock market", "stock", "bond", "loan", "bank", "rbi",
-        "federal reserve", "fed ", "interest rate", "finance", "budget",
+    "politics.global": [
+        "white house", "us election", "presidential election",
+        "senate", "congress ", "republican", "democrat",
+        "labour party", "conservative party", "tory",
+        "european union", "eu ", "downing street",
+        "prime minister of", "chancellor of",
     ],
-    "tech": [
-        "ai ", "artificial intelligence", "machine learning", "startup",
-        "app ", "software", "hardware", "semiconductor", "chip", "nvidia",
-        "microsoft", "google", "apple", "iphone", "android", "data",
-        "cyber", "hacker", "hack ", "security", "social media", "tech",
+
+    # geopolitics / war / diplomacy / climate summits
+    "geopolitics.conflict": [
+        "border clash", "ceasefire", "airstrike", "air strike",
+        "missile", "rocket fire", "shelling", "troops",
+        "gaza", "israel", "palestine", "west bank",
+        "ukraine", "russia", "nato", "iran", "iraq", "syria",
+        "hezbollah", "hamas", "taliban",
+        "rebel group", "militant group",
     ],
-    "geopolitics": [
-        "summit", "cop30", "cop 30", "climate summit", "climate talks",
-        "border", "dispute", "military", "defence", "defense", "nato",
-        "china", "russia", "ukraine", "israel", "palestine", "gaza",
-        "white house", "pentagon", "united nations", "u.n.", "un ",
-        "sanction", "trade war", "geopolitics",
+    "geopolitics.climate": [
+        "cop30", "cop 30", "cop29", "climate summit",
+        "climate talks", "climate finance", "carbon market",
+        "deforestation", "loss and damage", "paris agreement",
+        "un climate", "unfccc",
     ],
-    "national": [
-        "india ", "indian ", "delhi", "mumbai", "hyderabad", "bengaluru",
-        "kolkata", "chennai", "state", "district", "assembly",
-        "ls poll", "lok sabha", "rajya sabha", "national",
+
+    # economy / markets / business
+    "economy.macro": [
+        "gdp growth", "gdp contracts", "inflation",
+        "fiscal deficit", "current account deficit",
+        "recession", "slowdown", "macro data",
+        "industrial output", "cpi ", "wpi ",
+        "unemployment rate", "jobs data",
+        "monetary policy committee", "mpc meeting",
+        "central bank", "interest rate decision",
     ],
-    "cinema": [
-        "film", "movie", "box office", "actor", "actress", "director",
-        "trailer", "teaser", "song", "album", "bollywood", "tollywood",
-        "kollywood", "hollywood", "ott ", "netflix", "prime video",
-        "cinema", "biopic",
+    "economy.markets": [
+        "sensex", "nifty", "dow jones", "nasdaq",
+        "stock market", "equity market", "shares jump",
+        "shares fall", "stock surges", "stock plunges",
+        "bond yields", "treasury yields", "rupee",
+        "forex reserves", "currency market",
+        "livemint_latest", "moneycontrol",
     ],
-    "sports": [
-        "match", "tournament", "series", "world cup", "championship",
-        "league", "fixture", "score", "goal", "wicket", "run chase",
-        "cricket", "football", "soccer", "tennis", "badminton",
-        "olympics", "coach", "captain", "team", "ipl ",
-        "nba", "fifa",
+    "economy.agri": [
+        "cotton", "ginning mill", "paddy", "rice", "wheat",
+        "farmers", "minimum support price", "msp ",
+        "procurement centre", "mandi", "crop failure",
+        "agri export", "fertiliser subsidy",
+        "sugarcane", "soybean", "oilseed",
+        "cci chairman", "agriculture department",
     ],
-    "business": [
-        "startup", "valuation", "funding", "ipo", "merger", "acquisition",
-        "corporate", "earnings", "profit", "revenue", "losses",
-        "company", "shareholder",
+    "business.corporate": [
+        "ipo", "rights issue", "fpo ", "acquisition",
+        "merger", "stake sale", "takeover bid",
+        "earnings", "quarterly results", "q1 results",
+        "q2 results", "q3 results", "q4 results",
+        "profit rises", "profit falls", "loss widens",
+        "loss narrows", "startup", "valuation",
+        "funding round", "series a", "series b",
+        "unicorn", "board of directors", "ceo resigns",
+        "cfo resigns",
     ],
-    "crime": [
-        "murder", "killed", "shot dead", "arrested", "custody", "crime",
-        "theft", "robbery", "fraud", "scam", "chargesheet", "fir ",
-        "police case",
+    "business.crypto": [
+        "bitcoin", "ethereum", "crypto exchange",
+        "stablecoin", "defi", "nft ", "blockchain",
+        "web3", "token sale",
     ],
-    "science_health": [
-        "research", "study finds", "scientists", "lab ", "vaccine",
-        "covid", "disease", "virus", "health", "hospital", "aiims",
-        "genetic", "astronomy", "space", "nasa", "isro",
+
+    # tech / science / health
+    "tech.ai": [
+        "ai model", "artificial intelligence",
+        "machine learning", "neural network", "deep learning",
+        "chatbot", "openai", "gpt", "llm", "generative ai",
+        "fine-tuning", "prompt engineering", "inference api",
+    ],
+    "tech.consumer": [
+        "iphone", "android phone", "smartphone",
+        "laptop", "macbook", "windows update", "ios",
+        "android 15", "playstation", "xbox",
+        "gaming console", "headphones", "earbuds",
+        "smartwatch", "wearable", "gadget review",
+    ],
+    "tech.cyber": [
+        "data breach", "ransomware", "hacked", "cyber attack",
+        "credential stuffing", "malware", "phishing",
+        "security patch", "vulnerability", "zero-day",
+        "bug bounty", "leaked database",
+    ],
+    "science.space": [
+        "launch vehicle", "satellite", "rocket",
+        "mission control", "isro", "nasa", "spacex",
+        "chandrayaan", "lunar mission", "mars mission",
+        "space telescope", "orbiter", "lander",
+    ],
+"health.medical": [
+        "vaccine", "virus", "covid", "covid-19", "covid19",
+        "infection", "hospitalised", "hospitalized",
+        "intensive care", "icu", "icu ward",
+        "outbreak", "epidemic", "pandemic",
+        "health ministry", "health department",
+        "who ", "world health organization",
+        "diabetes", "hypertension", "cardiac arrest",
+        "heart attack", "stroke", "cancer",
+        "insulin", "antibiotics", "heart drugs",
+        "drug shortage", "medicine shortage",
+        "health-wellness", "health/wellness",
+    ],
+    "science.research": [
+        "study finds", "researchers", "scientists",
+        "peer reviewed", "peer-reviewed", "journal",
+        "published in", "trial", "experiment", "randomised",
+    ],
+
+    # sports (with sub-types)
+    "sports.cricket": [
+        "cricket", "test match", "odi", "t20", "t-20",
+        "ipl ", "wpl ", "wicket", "run chase", "run-chase",
+        "century", "half-century", "fifty off",
+        "bowler", "batsman", "all-rounder",
+        "batting lineup", "bowling attack",
+        "bazball", "ashes", "over rate",
+        "bbL ", "psl ",
+        "bbc_sport", "espncricinfo", "cricbuzz",
+    ],
+  "sports.football": [
+        "football", "soccer", "la liga", "serie a",
+        "premier league", "epl ", "bundesliga",
+        "champions league", "europa league",
+        "goalkeeper", "goalkeeping",
+        "goal", "brace", "hat-trick", "hat trick",
+        "striker", "midfielder", "defender", "full-back",
+        "red card", "yellow card", "penalty shootout",
+        "stoppage time winner",
+        # club / team hints
+        "fc ", "fc,", "man utd", "liverpool", "newcastle",
+        "real madrid", "barcelona", "psg", "bayern",
+        "lionesses", "tottenham", "spurs", "richarlison",
+    ],
+    "sports.other": [
+        "tennis", "grand slam", "badminton", "shuttler",
+        "olympics", "asian games", "athletics", "marathon",
+        "sprinter", "wrestling", "kabaddi", "hockey",
+        "shooting world cup", "10m air pistol", "10m air rifle",
+        "air pistol", "air rifle", "pistol event", "rifle event",
+        "squash", "boxing bout",
+    ],
+
+    # entertainment / culture / celebrity
+    "cine.bollywood": [
+        "bollywood", "hindi film", "karan johar",
+        "salman khan", "katrina kaif", "alia bhatt",
+        "shah rukh", "srk", "box office collection",
+        "opening weekend", "song release", "trailer out",
+        "item number", "masala entertainer",
+    ],
+    "cine.south": [
+        "tollywood", "telugu film", "tamil film",
+        "kollywood", "mollywood", "sandalwood",
+        "pan-india release", "mass entertainer",
+    ],
+    "cine.hollywood": [
+        "hollywood", "oscars", "academy awards",
+        "golden globes", "marvel", "dc universe",
+        "netflix original", "hbo series", "prime video",
+        "disney+", "hulu series",
+    ],
+    "culture.pop": [
+        "concert", "tour dates", "music festival",
+        "music video", "rapper", "pop star",
+        "album release", "streaming numbers",
+        "billboard chart", "grammy", "grammys",
+    ],
+    "celebrity.life": [
+        "postpones wedding", "wedding postponed",
+        "wedding delayed", "marries", "ties the knot",
+        "engagement", "fiancé", "wife", "husband",
+        "relationship rumours", "dating rumours",
+        "viral selfie", "instagram post",
+        "nazar is real", "smriti mandhana",
+        "ex-wife", "ex husband", "private ceremony",
+    ],
+    # crime / domestic / terror
+    "crime.domestic": [
+        # generic violent crime
+        "murder", "killed", "shot dead", "stabbing", "stabbed",
+        "brutal stabbing", "assaulted", "assault", "lynched",
+        "kidnapped", "kidnapping", "abducted", "abduction",
+        "minor girl", "rape", "sexual assault",
+        # policing / legal
+        "fir registered", "fir filed", "fir ", "chargesheet",
+        "charge-sheet", "custody", "police remand",
+        "police custody", "police case",
+        # fraud / scam
+        "fraud worth", "embezzlement", "scam", "ponzi",
+        # gun / shooting crime
+        "mall shooting", "school shooting", "mass shooting",
+        "active shooter", "open fire", "opened fire",
+        "fired shots", "gunman", "gunfire",
+        "shot at", "shot in the", "gunshot",
+        # cyber-crime-ish
+        "cyber crime", "cybercrime", "online fraud", "upi fraud",
+    ],
+    "crime.terror": [
+        "terrorist", "terror group", "terror outfit", "terror module",
+        "sleeper cell", "bomb blast", "serial blasts",
+        "ied", "improvised explosive device",
+        "naxal", "maoist", "red corridor",
+        "extremist outfit", "ulfa", "isis",
+        "islamic state", "jihadist", "fidayeen",
+        "suicide bomber", "terror attack",
+    ],
+
+    # accidents / disasters (non-terror)
+    "accident.disaster": [
+        # air / train / road
+        "plane crash", "jet crash", "fighter jet crash",
+        "aircraft crash", "helicopter crash",
+        "chopper crash", "air crash",
+        "train accident", "train derailment",
+        "derailed near", "bus overturns", "bus crash",
+        "road mishap", "road accident", "car crash",
+        "pile-up", "pile up",
+        # bridges / buildings / industrial
+        "building collapse", "bridge collapse",
+        "under-construction bridge", "industrial accident",
+        "factory fire", "warehouse fire",
+        # lorry / truck
+        "truck overturns", "lorry overturns",
+        "lorry skids off", "container lorry", "tanker overturns",
+        "skids off road", "vehicle skids off",
+        # disasters / fire
+        "massive fire breaks out", "fire breaks out at",
+        "warehouse blaze", "factory blaze",
+        "ship capsizes", "boat capsizes",
+    ],
+
+    # environment / weather / climate impacts
+    "env.weather": [
+        "rainfall", "heavy rain", "flood", "flash flood",
+        "landslide", "cyclone", "storm", "typhoon",
+        "heatwave", "cold wave", "monsoon", "drought",
+        "orange alert", "red alert", "yellow alert",
+    ],
+    "env.climate": [
+        "climate crisis", "global warming", "net zero",
+        "carbon emissions", "greenhouse gas",
+        "renewable energy", "solar plant", "wind farm",
+        "climate action plan",
+    ],
+
+    # society / education / social media etc.
+    "society.education": [
+        "university", "college", "students union",
+        "exam cancelled", "exam postponed", "results declared",
+        "board exam", "entrance test", "scholarship",
+        "campus protest", "ugc ", "ugc net", "neet ",
+        "jee main", "jee advanced",
+    ],
+    "society.social": [
+        "viral video", "social media backlash",
+        "trolled on", "instagram reel", "reels trend",
+        "x (formerly twitter)", "tweeted", "retweet",
+        "facebook post", "influencer", "content creator",
+        "internet reacts", "meme fest",
+        "horoscope", "zodiac", "aries", "taurus", "gemini",
+        "cancer ", "leo ", "virgo ", "libra ", "scorpio ",
+        "sagittarius", "capricorn", "aquarius", "pisces",
+    ],
+
+    # accidents / disasters (non-terror)
+    "accident.disaster": [
+        "plane crash", "jet crash", "fighter jet crash",
+        "aircraft crash", "helicopter crash",
+        "train accident", "train derailment",
+        "bus overturns", "bus crash", "road mishap",
+        "pile-up", "building collapse", "bridge collapse",
+        "industrial accident", "factory fire",
     ],
 }
 
 CATEGORY_FALLBACK = "misc"
+
+# Lower number = higher priority when counts & scores tie
+CATEGORY_PRIORITY_ORDER: Dict[str, int] = {
+    # high-salience “this is clearly about X”
+    "crime.terror": 1,
+    "crime.domestic": 2,
+    "accident.disaster": 3,
+
+    "sports.cricket": 10,
+    "sports.football": 11,
+    "sports.other": 12,
+
+    "celebrity.life": 15,
+    "cine.bollywood": 16,
+    "cine.south": 17,
+    "cine.hollywood": 18,
+    "culture.pop": 19,
+
+    "health.medical": 20,
+    "science.space": 21,
+    "science.research": 22,
+
+    "economy.agri": 25,
+    "economy.markets": 26,
+    "economy.macro": 27,
+    "business.corporate": 28,
+    "business.crypto": 29,
+
+    "politics.india": 40,
+    "politics.global": 41,
+    "geopolitics.conflict": 42,
+    "geopolitics.climate": 43,
+
+    "env.weather": 50,
+    "env.climate": 51,
+
+    "society.education": 60,
+    "society.social": 61,
+
+    "misc": 99,
+}
+DEFAULT_CATEGORY_PRIORITY = 80
+
 
 
 # ----------------- DATA STRUCTURES ----------------- #
@@ -127,7 +417,7 @@ class ClusterMeta:
     size: int
     centroid: List[float]
     medoid_id: str
-    category: str  # high-level topic label
+    category: str  # high-level topic label (maybe with subcategory)
 
 
 @dataclass
@@ -203,7 +493,13 @@ def compute_centroid_and_medoid(
 # ----------------- CATEGORY INFERENCE ----------------- #
 
 def score_text_categories(text: str) -> Dict[str, int]:
-    """Return simple keyword-based scores per category for a title/text."""
+    """
+    Return simple keyword-based scores per category for a title/text.
+    We *only* look for substring matches; no fancy NLP here.
+
+    NOTE: we deliberately do NOT include ultra-generic words like "crisis", "strike"
+    in crime/terror so that cotton crisis & worker strikes don't become "crime.terror".
+    """
     text_l = text.lower()
     scores: Dict[str, int] = {cat: 0 for cat in CATEGORY_KEYWORDS.keys()}
 
@@ -214,22 +510,65 @@ def score_text_categories(text: str) -> Dict[str, int]:
     return scores
 
 
-def infer_cluster_category(titles: List[str]) -> str:
-    """Aggregate keyword scores over all titles in the cluster."""
-    if not titles:
+def infer_cluster_category(texts: List[str]) -> str:
+    """
+    Decide a cluster's category based on per-article votes.
+
+    Steps:
+      - For each article text, compute category scores
+      - Take that article's best category (if any)
+      - Count how many articles picked each category
+      - Aggregate scores for tie-breaking
+      - Then choose with:
+          1) max article count
+          2) max total score
+          3) highest priority (lower number wins)
+    """
+    if not texts:
         return CATEGORY_FALLBACK
 
-    agg_scores: Dict[str, int] = {cat: 0 for cat in CATEGORY_KEYWORDS.keys()}
+    # how many articles chose this category as "best"
+    cat_title_count: Dict[str, int] = {
+        cat: 0 for cat in CATEGORY_KEYWORDS.keys()
+    }
+    # sum of best-scores across titles
+    cat_score_sum: Dict[str, int] = {
+        cat: 0 for cat in CATEGORY_KEYWORDS.keys()
+    }
 
-    for t in titles:
-        s = score_text_categories(t)
-        for cat, val in s.items():
-            agg_scores[cat] += val
+    for t in texts:
+        scores = score_text_categories(t)
+        if not scores:
+            continue
 
-    best_cat = max(agg_scores.items(), key=lambda kv: kv[1])
-    if best_cat[1] <= 0:
+        best_cat, best_score = max(scores.items(), key=lambda kv: kv[1])
+        if best_score <= 0:
+            continue
+
+        cat_title_count[best_cat] += 1
+        cat_score_sum[best_cat] += best_score
+
+    # filter to categories that actually got at least one “vote”
+    active = [
+        (cat, cat_title_count[cat], cat_score_sum[cat])
+        for cat in CATEGORY_KEYWORDS.keys()
+        if cat_title_count[cat] > 0
+    ]
+    if not active:
         return CATEGORY_FALLBACK
-    return best_cat[0]
+
+    def sort_key(item):
+        cat, count, score_sum = item
+        priority = CATEGORY_PRIORITY_ORDER.get(cat, DEFAULT_CATEGORY_PRIORITY)
+        # We want:
+        #  - more titles first
+        #  - then more score
+        #  - then lower priority number wins
+        return (-count, -score_sum, priority)
+
+    active.sort(key=sort_key)
+    best_cat = active[0][0]
+    return best_cat
 
 
 # ----------------- FULL FETCH (INITIAL) ----------------- #
@@ -238,12 +577,15 @@ def fetch_all_points(
     client: QdrantClient,
 ) -> Tuple[List[str], np.ndarray, List[str]]:
     """
-    Fetch ALL points' ids, vectors, and titles from Qdrant.
+    Fetch ALL points' ids, vectors, and topic-texts from Qdrant.
+
+    "topic-text" = title + source + domain (joined) so category
+    inference can also use which section/domain it came from.
     """
-    print("🔎 Fetching ALL points from Qdrant (ids + vectors + titles)...")
+    print("🔎 Fetching ALL points from Qdrant (ids + vectors + titles/source/domain)...")
     ids: List[str] = []
     vecs: List[List[float]] = []
-    titles: List[str] = []
+    topic_texts: List[str] = []
 
     offset = None
     page_idx = 0
@@ -263,8 +605,17 @@ def fetch_all_points(
         for p in points:
             ids.append(str(p.id))
             vecs.append(p.vector)
+
             payload = p.payload or {}
-            titles.append(payload.get("title", "") or "")
+            title = payload.get("title", "") or ""
+            source = payload.get("source", "") or ""
+            domain = payload.get("domain", "") or ""
+            url = payload.get("url", "") or ""
+            topic_text = " | ".join(
+                part for part in (title, source, domain, url) if part
+            )
+            topic_texts.append(topic_text)
+
 
         print(f"  📦 Page {page_idx}: {len(points)} points (total {len(ids)})")
         if offset is None:
@@ -276,13 +627,13 @@ def fetch_all_points(
 
     arr = np.array(vecs, dtype=np.float32)
     print(f"✅ Total points: {len(ids)}, dim={arr.shape[1]}")
-    return ids, arr, titles
+    return ids, arr, topic_texts
 
 
 def build_full_summary(
     ids: List[str],
     vectors: np.ndarray,
-    titles: List[str],
+    topic_texts: List[str],
     labels: np.ndarray,
 ) -> ClusteringSummary:
     print("📊 Building full clustering summary with topic categories...")
@@ -298,10 +649,10 @@ def build_full_summary(
         idxs = np.where(mask)[0]
         cluster_ids = [ids[i] for i in idxs]
         cluster_vecs = vectors[mask]
-        cluster_titles = [titles[i] for i in idxs]
+        cluster_texts = [topic_texts[i] for i in idxs]
 
         centroid, medoid_id = compute_centroid_and_medoid(cluster_vecs, cluster_ids)
-        category = infer_cluster_category(cluster_titles)
+        category = infer_cluster_category(cluster_texts)
 
         cm = ClusterMeta(
             label=label,
@@ -313,7 +664,7 @@ def build_full_summary(
         meta[str(label)] = cm
         print(
             f"   • cluster {label:>3}: size={cm.size:>4}, "
-            f"category={cm.category:<12}, medoid_id={cm.medoid_id[:8]}..."
+            f"category={cm.category:<20}, medoid_id={cm.medoid_id[:8]}..."
         )
 
     summary = ClusteringSummary(
@@ -333,11 +684,13 @@ def fetch_noise_points(
 ) -> Tuple[List[str], np.ndarray, List[str]]:
     """
     Fetch points that currently have cluster == -1 (or no cluster).
+
+    Again we build "topic-text" as title+source+domain for category inference.
     """
     print("🔎 Fetching NOISE / unassigned points (cluster == -1 or missing)...")
     ids: List[str] = []
     vecs: List[List[float]] = []
-    titles: List[str] = []
+    topic_texts: List[str] = []
 
     offset = None
     page_idx = 0
@@ -355,12 +708,16 @@ def fetch_noise_points(
             break
 
         for p in points:
-            payload = p.payload or {}
-            label = payload.get("cluster", -1)
-            if label == -1:
-                ids.append(str(p.id))
-                vecs.append(p.vector)
-                titles.append(payload.get("title", "") or "")
+                payload = p.payload or {}
+                title = payload.get("title", "") or ""
+                source = payload.get("source", "") or ""
+                domain = payload.get("domain", "") or ""
+                url = payload.get("url", "") or ""
+                topic_text = " | ".join(
+                    part for part in (title, source, domain, url) if part
+                )
+                topic_texts.append(topic_text)
+
 
         print(
             f"  📦 Page {page_idx}: scanned {len(points)} points "
@@ -375,7 +732,7 @@ def fetch_noise_points(
 
     arr = np.array(vecs, dtype=np.float32)
     print(f"✅ Noise points: {len(ids)}, dim={arr.shape[1]}")
-    return ids, arr, titles
+    return ids, arr, topic_texts
 
 
 # ----------------- CLUSTERS.JSON I/O ----------------- #
@@ -397,10 +754,11 @@ def load_existing_summary() -> Optional[ClusteringSummary]:
             category=meta.get("category", CATEGORY_FALLBACK),
         )
 
+    # num_points is mostly informative; we keep previous value
     return ClusteringSummary(
-        num_points=data["num_points"],
-        num_clusters=data["num_clusters"],
-        num_noise=data["num_noise"],
+        num_points=data.get("num_points", 0),
+        num_clusters=len(clusters_dict),
+        num_noise=data.get("num_noise", 0),
         clusters=clusters_dict,
     )
 
@@ -457,11 +815,73 @@ def write_labels_to_qdrant(
             points=group_ids,
         )
         print(
-            f"   • cluster={label:>3}, category={category:<12} "
+            f"   • cluster={label:>3}, category={category:<20} "
             f"→ updated {len(group_ids)} points"
         )
 
     print("✅ Finished updating Qdrant payloads.")
+
+
+# ----------------- NOISE ATTACH TO CENTROIDS ----------------- #
+
+def attach_noise_to_centroids(
+    ids: List[str],
+    vectors: np.ndarray,
+    topic_texts: List[str],  # not used right now, kept for possible future logic
+    labels: np.ndarray,
+    summary: ClusteringSummary,
+) -> Tuple[np.ndarray, ClusteringSummary]:
+    """
+    HDBSCAN will mark some points as -1 (noise).
+    Here we try to attach part of that noise to nearest existing centroids
+    if cosine similarity is high enough (NOISE_ATTACH_THRESHOLD).
+
+    This keeps noise small without going fully crazy.
+    """
+    if not summary.clusters:
+        return labels, summary
+
+    noise_mask = (labels == -1)
+    num_noise = int(np.sum(noise_mask))
+    if num_noise == 0:
+        return labels, summary
+
+    print(f"🔧 Trying to rescue {num_noise} noise points by centroid similarity...")
+
+    # Build centroid matrix
+    cluster_labels = []
+    centroids = []
+    for lbl_str, meta in summary.clusters.items():
+        cluster_labels.append(int(lbl_str))
+        centroids.append(np.array(meta.centroid, dtype=np.float32))
+    centroids = np.stack(centroids, axis=0)  # (C, D)
+    cluster_labels = np.array(cluster_labels, dtype=np.int32)
+
+    # Normalize input vectors (they should already be normalized, but be safe)
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-9
+    vec_normed = vectors / norms
+
+    noise_indices = np.where(noise_mask)[0]
+    attached = 0
+
+    for idx in noise_indices:
+        v = vec_normed[idx]
+        sims = centroids @ v
+        best_idx = int(np.argmax(sims))
+        best_sim = float(sims[best_idx])
+        if best_sim >= NOISE_ATTACH_THRESHOLD:
+            new_label = int(cluster_labels[best_idx])
+            labels[idx] = new_label
+            meta = summary.clusters.get(str(new_label))
+            if meta:
+                meta.size += 1
+            attached += 1
+
+    new_noise = int(np.sum(labels == -1))
+    summary.num_noise = new_noise
+
+    print(f"   → attached {attached} points; noise left: {new_noise}")
+    return labels, summary
 
 
 # ----------------- OUTLIER RECLUSTER MERGE ----------------- #
@@ -470,7 +890,7 @@ def extend_summary_with_noise_clusters(
     prev: ClusteringSummary,
     noise_ids: List[str],
     noise_vectors: np.ndarray,
-    noise_titles: List[str],
+    noise_texts: List[str],
     noise_labels: np.ndarray,
 ) -> Tuple[ClusteringSummary, np.ndarray]:
     """
@@ -509,10 +929,10 @@ def extend_summary_with_noise_clusters(
         idxs = np.where(mask)[0]
         cluster_ids = [noise_ids[i] for i in idxs]
         cluster_vecs = noise_vectors[mask]
-        cluster_titles = [noise_titles[i] for i in idxs]
+        cluster_texts = [noise_texts[i] for i in idxs]
 
         centroid, medoid_id = compute_centroid_and_medoid(cluster_vecs, cluster_ids)
-        category = infer_cluster_category(cluster_titles)
+        category = infer_cluster_category(cluster_texts)
 
         global_label = local_to_global[local_label]
         cm = ClusterMeta(
@@ -525,7 +945,7 @@ def extend_summary_with_noise_clusters(
         new_clusters[str(global_label)] = cm
         print(
             f"   • new cluster {global_label:>3}: size={cm.size:>4}, "
-            f"category={cm.category:<12}, medoid_id={cm.medoid_id[:8]}..."
+            f"category={cm.category:<20}, medoid_id={cm.medoid_id[:8]}..."
         )
 
     global_labels = []
@@ -567,12 +987,17 @@ def main() -> None:
     # MODE 1: INITIAL FULL CLUSTERING
     if existing_summary is None:
         print("🚀 No clusters.json found → running INITIAL full topic clustering...")
-        ids, vectors, titles = fetch_all_points(client)
+        ids, vectors, topic_texts = fetch_all_points(client)
         if len(ids) == 0:
             return
 
         labels = run_hdbscan(vectors)
-        summary = build_full_summary(ids, vectors, titles, labels)
+        summary = build_full_summary(ids, vectors, topic_texts, labels)
+
+        # try to attach noise to centroids
+        labels, summary = attach_noise_to_centroids(
+            ids, vectors, topic_texts, labels, summary
+        )
 
         save_summary(summary)
         write_labels_to_qdrant(client, ids, labels, summary)
@@ -588,7 +1013,7 @@ def main() -> None:
 
     # MODE 2: OUTLIER-ONLY RE-CLUSTERING
     print("🔁 clusters.json found → topic-clustering NOISE points only...")
-    noise_ids, noise_vectors, noise_titles = fetch_noise_points(client)
+    noise_ids, noise_vectors, noise_texts = fetch_noise_points(client)
     if len(noise_ids) == 0:
         print("✅ No unassigned/noise points. Nothing to do.")
         return
@@ -598,8 +1023,13 @@ def main() -> None:
         existing_summary,
         noise_ids,
         noise_vectors,
-        noise_titles,
+        noise_texts,
         noise_labels_local,
+    )
+
+    # again, try to attach any remaining noise in this subset
+    noise_labels_global, new_summary = attach_noise_to_centroids(
+        noise_ids, noise_vectors, noise_texts, noise_labels_global, new_summary
     )
 
     write_labels_to_qdrant(client, noise_ids, noise_labels_global, new_summary)
