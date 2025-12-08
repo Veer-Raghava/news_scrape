@@ -34,3 +34,6 @@ project/data/*.log
 # Windows junk
 Thumbs.db
 desktop.ini
+
+project/data/
+

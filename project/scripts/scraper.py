@@ -18,7 +18,13 @@ SCRAPED = os.path.join(DATA, "scraped_urls.jsonl")
 
 BAD_EXT = [".mp4", "/video", "/videos"]
 
+# Node backend endpoint for saving feed items
+NODE_STORE_ENDPOINT = "http://localhost:5000/api/scrape/store"
 
+
+# ------------------------------------------
+# LOAD EXISTING SCRAPED URLS
+# ------------------------------------------
 def load_scraped():
     scraped = set()
     if os.path.exists(SCRAPED):
@@ -41,7 +47,7 @@ def is_bad(url):
 
 
 # ------------------------------------------
-# CLEAN BOILERPLATE LINES
+# CLEAN BOILERPLATE
 # ------------------------------------------
 def clean_boilerplate(text):
     BAD_PHRASES = [
@@ -71,6 +77,9 @@ def clean_boilerplate(text):
     return "\n".join(cleaned)
 
 
+# ------------------------------------------
+# EXTRACT ARTICLE TEXT
+# ------------------------------------------
 def extract_text(url):
     try:
         r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
@@ -89,10 +98,40 @@ def extract_text(url):
         return None
 
     text = "\n".join(cleaned)
-    text = clean_boilerplate(text)  # <<< ONLY ADDITIONAL LINE
+    text = clean_boilerplate(text)
     return text
 
 
+# ------------------------------------------
+# EXTRACT IMAGES
+# ------------------------------------------
+def extract_images(url):
+    try:
+        r = requests.get(url, timeout=10, headers={"User-Agent": "Mozilla/5.0"})
+        soup = BeautifulSoup(r.text, "html.parser")
+    except:
+        return []
+
+    images = []
+
+    # og:image
+    tag = soup.find("meta", property="og:image")
+    if tag and tag.get("content"):
+        images.append({"source_url": tag["content"]})
+
+    # normal <img> tags
+    for img in soup.find_all("img"):
+        src = img.get("src") or img.get("data-src")
+        if src and src.startswith("http"):
+            images.append({"source_url": src})
+
+    # limit to avoid huge lists
+    return images[:5]
+
+
+# ------------------------------------------
+# MAIN SCRAPER
+# ------------------------------------------
 def scrape():
     print("\n🔥 SCRAPER STARTED\n")
 
@@ -106,7 +145,7 @@ def scrape():
         for line in q:
             item = json.loads(line)
 
-            url = item.get("link") or item.get("url")  # FIX FOR KEY ERROR
+            url = item.get("link") or item.get("url")
 
             if url in scraped_urls or is_bad(url):
                 continue
@@ -116,8 +155,13 @@ def scrape():
 
             if not text or len(text.split()) < 80:
                 print("   ❌ TOO SHORT — NOT SAVED")
+                skipped += 1
                 continue
 
+            domain = urlparse(url).netloc
+            images = extract_images(url)
+
+            # FULL ARTICLE RECORD (saved locally)
             rec = {
                 "url": url,
                 "title": item.get("title"),
@@ -126,15 +170,36 @@ def scrape():
                 "feed": item.get("feed"),
                 "published": item.get("published"),
                 "scraped_at": time.time(),
-                "domain": urlparse(url).netloc
+                "domain": domain,
+                "images": images
             }
 
             out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            add_scraped(url)          # << MOVED HERE
-            scraped_urls.add(url)     # << AFTER SAVE
+
+            # --------------------------
+            # SEND TO NODE BACKEND
+            # --------------------------
+            node_payload = {
+                "title": rec["title"] or "Untitled",
+                "images": images,
+                "domain": domain
+            }
+
+            try:
+                res = requests.post(
+                    NODE_STORE_ENDPOINT,
+                    json=[node_payload],  # Node expects an array
+                    timeout=10
+                )
+                print(f"   ✔ Sent to Node ({res.status_code})")
+            except Exception as e:
+                print("   ❌ Failed to send to Node:", e)
+
+            add_scraped(url)
+            scraped_urls.add(url)
             saved += 1
 
-            print(f"   ✔ SAVED ({rec['word_count']} words)")
+            print(f"   ✔ SAVED LOCALLY ({rec['word_count']} words)")
 
     open(QUEUE, "w").close()
     print("\n🧹 queue cleared!")
